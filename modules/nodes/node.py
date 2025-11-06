@@ -108,7 +108,8 @@ class SaveImageWithMetaData:
             },
         }
 
-    RETURN_TYPES = ()
+    # --- CHANGE 1: Specify the output type ---
+    RETURN_TYPES = ("IMAGE",)
     FUNCTION = "save_images"
     OUTPUT_NODE = True
     DESCRIPTION = "Saves the input images with metadata to your ComfyUI output directory."
@@ -239,8 +240,9 @@ class SaveImageWithMetaData:
 
             with open(batch_json_file, "w", encoding="utf-8") as f:
                 json.dump(extra_pnginfo["workflow"], f)
-
-        return {"ui": {"images": results}}
+        
+        # --- CHANGE 2: Return the original images along with the UI data ---
+        return {"ui": {"images": results}, "result": (images,)}
 
     def prepare_pnginfo(self, metadata, pnginfo_dict, batch_number, total_images, prompt, extra_pnginfo, metadata_scope):
         """
