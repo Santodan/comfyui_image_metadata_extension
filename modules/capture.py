@@ -13,54 +13,32 @@ from .trace import Trace
 from execution import get_input_data
 from comfy_execution.graph import DynamicPrompt
 
-class _CacheAdapter:
-    def __init__(self, caches):
-        self._caches = caches
 
-    def get_output_cache(self, input_unique_id, unique_id):
-        c = self._caches
-        # early exit when no caches object present
-        if c is None:
-            return None
+class OutputCacheCompat:
+    """Handles cache access across ComfyUI versions.
+    Uses get_output_cache() in version 0.3.67 and newer, get() in 0.3.66 and lower.
+    """
+    def __init__(self, cache):
+        self._cache = cache
 
-        # If the object already supports the old API, call it directly
-        if hasattr(c, "get_output_cache"):
-            try:
-                return c.get_output_cache(input_unique_id, unique_id)
-            except Exception:
-                pass
+    def get_output_cache(self, input_unique_id, unique_id=None):
+        # For version 0.3.67 and newer
+        if hasattr(self._cache, "get"):
+            return self._cache.get(input_unique_id)
+        return getattr(self._cache, "outputs", {}).get(input_unique_id, None)
 
-        # Try several likely newer APIs / attributes
-        try:
-            if hasattr(c, "get_latest_cache"):
-                return c.get_latest_cache()
-            if hasattr(c, "get_latest"):
-                maybe = c.get_latest()
-                return maybe
-            if hasattr(c, "latest"):
-                attr = getattr(c, "latest")
-                return attr() if callable(attr) else attr
-            if hasattr(c, "get_cache"):
-                # some implementations might use get_cache(unique_id)
-                try:
-                    return c.get_cache(unique_id)
-                except TypeError:
-                    return c.get_cache()
-            # If it's indexable, try first element
-            try:
-                return c[0]
-            except Exception:
-                pass
-            # dict-like fallback
-            if hasattr(c, "get"):
-                try:
-                    return c.get(unique_id)
-                except TypeError:
-                    return c.get(None)
-        except Exception:
-            return None
+    def get(self, input_unique_id):
+        # For version 0.3.66 and lower
+        if hasattr(self._cache, "get"):
+            return self._cache.get(input_unique_id)
+        return getattr(self._cache, "outputs", {}).get(input_unique_id, None)
+    
+    # fix: https://github.com/edelvarden/comfyui_image_metadata_extension/issues/67
+    def get_cache(self, input_unique_id, unique_id=None):
+        if hasattr(self._cache, "get_cache"):
+            return self._cache.get_cache(input_unique_id, unique_id)
+        return self.get_output_cache(input_unique_id, unique_id)
 
-        return None
 
 class Capture:
     @classmethod
@@ -68,29 +46,31 @@ class Capture:
         inputs = {}
         prompt = hook.current_prompt
         extra_data = hook.current_extra_data
-        # Wrap prompt_executer.caches with adapter (do NOT call get_latest_cache on CacheSet)
-        caches_obj = getattr(getattr(hook, "prompt_executer", None), "caches", None)
-        outputs = _CacheAdapter(caches_obj) if caches_obj is not None else None
+
+        if hook.prompt_executer and hook.prompt_executer.caches:
+            raw_outputs = hook.prompt_executer.caches.outputs
+            outputs = (
+                raw_outputs
+                if hasattr(raw_outputs, "get_output_cache")
+                else OutputCacheCompat(raw_outputs)
+            )
+        else:
+            outputs = None
 
         for node_id, obj in prompt.items():
             class_type = obj["class_type"]
             obj_class = NODE_CLASS_MAPPINGS[class_type]
-            node_inputs = prompt[node_id]["inputs"]
-            
-            try:
-                # Use new caching system
-                input_data = get_input_data(
-                    node_inputs, obj_class, node_id, outputs, DynamicPrompt(prompt), extra_data
-                )
-            except AttributeError:
-                # Fallback if cache access fails
-                input_data = [{}, {}]
+            node_inputs = obj["inputs"]
+
+            input_data = get_input_data(
+                node_inputs, obj_class, node_id, outputs, DynamicPrompt(prompt), extra_data
+            )
 
             # Process field data mappings for the captured inputs
             for node_class, metas in CAPTURE_FIELD_LIST.items():
                 if class_type != node_class:
                     continue
-                
+
                 for meta, field_data in metas.items():
                     # Skip invalidated nodes
                     if field_data.get("validate") and not field_data["validate"](
@@ -106,20 +86,21 @@ class Capture:
                     value = field_data.get("value")
                     if value is not None:
                         inputs[meta].append((node_id, value))
-                    else:
-                        selector = field_data.get("selector")
-                        if selector:
-                            v = selector(node_id, obj, prompt, extra_data, outputs, input_data)
-                            cls._append_value(inputs, meta, node_id, v)
-                            continue
+                        continue
 
-                        # Fetch and process value from field_name
-                        field_name = field_data["field_name"]
-                        value = input_data[0].get(field_name)
-                        if value is not None:
-                            format_func = field_data.get("format")
-                            v = cls._apply_formatting(value, input_data, format_func)
-                            cls._append_value(inputs, meta, node_id, v)
+                    selector = field_data.get("selector")
+                    if selector:
+                        v = selector(node_id, obj, prompt, extra_data, outputs, input_data)
+                        cls._append_value(inputs, meta, node_id, v)
+                        continue
+
+                    # Fetch and process value from field_name
+                    field_name = field_data["field_name"]
+                    value = input_data[0].get(field_name)
+                    if value is not None:
+                        format_func = field_data.get("format")
+                        v = cls._apply_formatting(value, input_data, format_func)
+                        cls._append_value(inputs, meta, node_id, v)
 
         return inputs
 
